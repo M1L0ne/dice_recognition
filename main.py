@@ -122,41 +122,12 @@ def find_pips(gray, contrast, masks, zone):
     return groups
 
 
-def face_candidates(points, mask, color):
-    coords, areas = points[:, :2], points[:, 2]
-    candidates = []
-
-    def check(value, center, transform):
-        # Проверяем, что шаблон лежит на поверхности нужного цвета.
-        xs, ys = np.rint(center + FACE_SAMPLES @ transform).astype(int).T
-        if min(xs.min(), ys.min()) < 0 or xs.max() >= mask.shape[1] or ys.max() >= mask.shape[0]:
-            return
-        coverage = mask[ys, xs].mean()
-        if coverage < 0.73:
-            return
-
-        expected = center + PATTERNS[value] @ transform
-        distances = np.linalg.norm(expected[:, None] - coords, axis=2)
-        matches = distances.argmin(axis=1)
-        errors = distances[np.arange(value), matches]
-        if errors.max() > 4.4 or len(set(matches)) != value:
-            return
-        # Считаем лишние точки в координатах шаблона.
-        local = (coords - center) @ np.linalg.inv(transform)
-        extras = np.abs(local).max(axis=1) < 1.45
-        extras[matches] = False
-        matched = value - extras.sum()
-        if matched <= 0:
-            return
-        # Сначала сравниваем число совпадений с учётом лишних точек,
-        # затем точность совпадений, размер точек и цвет поверхности.
-        score = (matched, -errors.mean(), areas[matches].mean(), coverage)
-        candidates.append(Face(center, value, color, frozenset(matches), score))
-
+def face_poses(coords):
+    """Положения и допустимые значения шаблона по найденным точкам."""
     # У единицы единственная точка задаёт центр.
     single_dot = 12 * np.eye(2)
     for center in coords:
-        check(1, center, single_dot)
+        yield center, single_dot, (1,)
 
     # У остальных граней две крайние точки задают диагональ.
     for first, second in combinations(coords, 2):
@@ -171,8 +142,45 @@ def face_candidates(points, mask, color):
             transform = np.array([[axis_x, axis_y], [-ratio * axis_y, ratio * axis_x]])
             # У шестёрки шаг между тремя рядами меньше расстояния между столбцами.
             values = (2, 3, 4, 5) if ratio == 1 else (6,)
-            for value in values:
-                check(value, center, transform)
+            yield center, transform, values
+
+
+def face_coverage(mask, center, transform):
+    xs, ys = np.rint(center + FACE_SAMPLES @ transform).astype(int).T
+    if min(xs.min(), ys.min()) < 0 or xs.max() >= mask.shape[1] or ys.max() >= mask.shape[0]:
+        return 0.0
+    return mask[ys, xs].mean()
+
+
+def face_candidates(points, mask, color):
+    coords, areas = points[:, :2], points[:, 2]
+    candidates = []
+
+    def check(value, center, transform, coverage):
+        expected = center + PATTERNS[value] @ transform
+        distances = np.linalg.norm(expected[:, None] - coords, axis=2)
+        matches = distances.argmin(axis=1)
+        errors = distances[np.arange(value), matches]
+        if errors.max() > 4.4 or len(set(matches)) != value:
+            return
+
+        local = (coords - center) @ np.linalg.inv(transform)
+        extras = np.abs(local).max(axis=1) < 1.45
+        extras[matches] = False
+        matched = value - extras.sum()
+        if matched <= 0:
+            return
+        # Сначала сравниваем совпадения с учётом лишних точек,
+        # затем точность, размер точек и цвет поверхности.
+        score = (matched, -errors.mean(), areas[matches].mean(), coverage)
+        candidates.append(Face(center, value, color, frozenset(matches), score))
+
+    for center, transform, values in face_poses(coords):
+        coverage = face_coverage(mask, center, transform)
+        if coverage < 0.73:
+            continue
+        for value in values:
+            check(value, center, transform, coverage)
     return candidates
 
 
@@ -190,6 +198,10 @@ def recognize(image):
         if points:
             candidates.extend(face_candidates(np.array(points), masks[color], color))
 
+    return Recognition(select_faces(candidates), masks, contrast, zone, groups)
+
+
+def select_faces(candidates):
     # Шаблоны с лучшей оценкой получают точки первыми.
     faces = []
     for face in sorted(candidates, key=lambda item: item.score, reverse=True):
@@ -200,7 +212,7 @@ def recognize(image):
         ):
             continue
         faces.append(face)
-    return Recognition(faces, masks, contrast, zone, groups)
+    return faces
 
 
 def die_box(face, mask, faces):
@@ -243,17 +255,21 @@ def draw_zone(image, zone):
             cv.line(image, (x, y), (x, min(y + 8, bottom)), color, 1, cv.LINE_AA)
 
 
-def process(path, output, save_contrast, *, stages=False):
-    target = output / path.name
-    if target.resolve() == path.resolve():
-        raise ValueError("Укажите отдельную папку для результатов.")
-
+def read_photo(path):
     source = cv.imread(str(path))
     if source is None:
         raise ValueError(f"Не удалось прочитать снимок {path}")
 
     height = max(1, round(source.shape[0] * WORK_WIDTH / source.shape[1]))
-    image = cv.resize(source, (WORK_WIDTH, height), interpolation=cv.INTER_AREA)
+    return cv.resize(source, (WORK_WIDTH, height), interpolation=cv.INTER_AREA)
+
+
+def process(path, output, save_contrast, *, stages=False):
+    target = output / path.name
+    if target.resolve() == path.resolve():
+        raise ValueError("Укажите отдельную папку для результатов.")
+
+    image = read_photo(path)
     recognition = recognize(image)
     zone = recognition.zone
     annotated = image.copy() if stages else image

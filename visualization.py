@@ -1,7 +1,9 @@
 """Изображения этапов распознавания и график частот."""
 
 import cv2 as cv
+import numpy as np
 from matplotlib.figure import Figure
+from matplotlib.patches import Rectangle
 from matplotlib.ticker import MaxNLocator
 
 
@@ -83,3 +85,73 @@ def save_distribution(path, frequencies, photo_count):
     ax.grid(axis="y", color="#dde5eb", linewidth=0.8)
     ax.spines[["top", "right"]].set_visible(False)
     figure.savefig(path, dpi=175)
+
+
+METHOD_COLORS = ("#177965", "#3c69af", "#b24f56")
+
+
+def save_method_distribution(path, frequencies, names, photo_count):
+    values = np.arange(1, 7)
+    figure = Figure(figsize=(9, 5.2), layout="constrained", facecolor="white")
+    figure.suptitle("Распределение очков по методам", fontsize=18, fontweight="bold")
+    ax = figure.subplots()
+    for offset, (method, color) in enumerate(zip(names, METHOD_COLORS), -1):
+        counts = [frequencies[method][value] for value in values]
+        bars = ax.bar(values + 0.25 * offset, counts, width=0.23, color=color, label=names[method])
+        ax.bar_label(bars, padding=3, fontsize=8)
+    ax.set_title(f"Снимков: {photo_count}", fontsize=11, pad=12)
+    ax.set(xlabel="Очки на верхней грани", ylabel="Количество кубиков", xticks=values)
+    maximum = max((amount for count in frequencies.values() for amount in count.values()), default=0)
+    ax.set_ylim(top=maximum * 1.16 + 1)
+    ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+    ax.set_axisbelow(True)
+    ax.grid(axis="y", color="#dde5eb", linewidth=0.8)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.13), ncols=3, frameon=False)
+    figure.savefig(path, dpi=155)
+
+
+def save_method_preview(path, image, zone, visible, names, reference, regions, region_crop):
+    figure = Figure(figsize=(14, 8.5), layout="constrained", facecolor="#f5f7fa")
+    figure.suptitle(f"Сравнение методов · {path.stem}", fontsize=17, fontweight="bold")
+    grid = figure.add_gridspec(2, 6)
+    left, top, right, bottom = zone
+    image_height, image_width = image.shape[:2]
+    x0, x1 = max(0, left - 26), min(image_width, right + 26)
+    y0, y1 = max(0, top - 26), min(image_height, bottom + 26)
+    rgb = cv.cvtColor(image, cv.COLOR_BGR2RGB)
+
+    def panel(slot, view, title, points=(), color="#f5b549"):
+        ax = figure.add_subplot(slot)
+        ax.imshow(view[y0:y1, x0:x1], extent=(x0 - 0.5, x1 - 0.5, y1 - 0.5, y0 - 0.5))
+        ax.add_patch(Rectangle(
+            (left, top), right - left, bottom - top, fill=False,
+            edgecolor="#68d4ef", linewidth=0.8, linestyle="--",
+        ))
+        for x, y, value in points:
+            ax.scatter(x, y, s=21, facecolors="none", edgecolors=color, linewidths=1.3)
+            ax.annotate(str(value), (x, y), xytext=(5, 4), textcoords="offset points",
+                        color="white", weight="bold", fontsize=9,
+                        bbox={"boxstyle": "round,pad=0.13", "fc": color, "ec": "none"})
+        ax.set(xlim=(x0, x1), ylim=(y1, y0), title=title)
+        ax.set_axis_off()
+
+    reference_title = "Ручная разметка" if reference is not None else "Исходный снимок"
+    panel(grid[0, :3], rgb, reference_title, reference or (), "#79521b")
+    segmented = rgb.copy()
+    cropped = segmented[region_crop]
+    palette = np.array([
+        [249, 171, 87], [109, 215, 225], [214, 142, 245], [171, 224, 111],
+        [249, 158, 174], [234, 223, 127], [145, 175, 255],
+    ])
+    for color, labels in enumerate(regions):
+        foreground = labels > 1
+        cropped[foreground] = (0.52 * cropped[foreground] + 0.48 * palette[(labels[foreground] + color) % len(palette)])
+    panel(grid[0, 3:], segmented, "Области после водораздела")
+
+    for index, (method, color) in enumerate(zip(names, METHOD_COLORS)):
+        points = [(face.center[0], face.center[1], face.value) for face in visible[method]]
+        score = sum(value for _, _, value in points)
+        title = f"{names[method]} · {len(points)} куб. / {score} очк."
+        panel(grid[1, 2 * index : 2 * index + 2], rgb, title, points, color)
+    figure.savefig(path, dpi=145, pil_kwargs={"quality": 90})
