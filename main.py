@@ -1,12 +1,15 @@
 """Распознавание точек на игральных кубиках с помощью OpenCV."""
 
 import argparse
+from collections import Counter
 from dataclasses import dataclass
 from itertools import combinations
 from pathlib import Path
 
 import cv2 as cv
 import numpy as np
+
+from visualization import save_distribution, save_stages
 
 WORK_WIDTH = 1200
 # Примерные границы внутри коробки (доли ширины и высоты снимка).
@@ -38,6 +41,15 @@ class Face:
     color: int
     pips: frozenset
     score: tuple
+
+
+@dataclass
+class Recognition:
+    faces: list[Face]
+    masks: list[np.ndarray]
+    contrast: np.ndarray
+    zone: tuple[int, int, int, int]
+    groups: list[list[tuple[float, float, float]]]
 
 
 def analysis_zone(shape):
@@ -188,7 +200,7 @@ def recognize(image):
         ):
             continue
         faces.append(face)
-    return faces, masks, contrast, zone
+    return Recognition(faces, masks, contrast, zone, groups)
 
 
 def die_box(face, mask, faces):
@@ -231,7 +243,7 @@ def draw_zone(image, zone):
             cv.line(image, (x, y), (x, min(y + 8, bottom)), color, 1, cv.LINE_AA)
 
 
-def process(path, output, save_contrast):
+def process(path, output, save_contrast, *, stages=False):
     target = output / path.name
     if target.resolve() == path.resolve():
         raise ValueError("Укажите отдельную папку для результатов.")
@@ -242,32 +254,39 @@ def process(path, output, save_contrast):
 
     height = max(1, round(source.shape[0] * WORK_WIDTH / source.shape[1]))
     image = cv.resize(source, (WORK_WIDTH, height), interpolation=cv.INTER_AREA)
-    faces, masks, contrast, zone = recognize(image)
-    draw_zone(image, zone)
-    visible = [face for face in faces if inside(face.center, zone)]
+    recognition = recognize(image)
+    zone = recognition.zone
+    annotated = image.copy() if stages else image
+    draw_zone(annotated, zone)
+    visible = [face for face in recognition.faces if inside(face.center, zone)]
     for face in visible:
-        x1, y1, x2, y2 = die_box(face, masks[face.color], faces)
-        cv.rectangle(image, (x1, y1), (x2, y2), GREEN, 2)
+        x1, y1, x2, y2 = die_box(face, recognition.masks[face.color], recognition.faces)
+        cv.rectangle(annotated, (x1, y1), (x2, y2), GREEN, 2)
         label = str(face.value)
         (width, _), _ = cv.getTextSize(label, cv.FONT_HERSHEY_SIMPLEX, 0.65, 2)
         position = ((x1 + x2 - width) // 2, max(17, y1 - 5))
         for color, thickness in [((15, 15, 15), 4), (GREEN, 2)]:
             cv.putText(
-                image, label, position, cv.FONT_HERSHEY_SIMPLEX, 0.65, color, thickness, cv.LINE_AA
+                annotated, label, position, cv.FONT_HERSHEY_SIMPLEX, 0.65, color, thickness, cv.LINE_AA
             )
 
-    if not cv.imwrite(str(target), image):
+    if not cv.imwrite(str(target), annotated):
         raise ValueError(f"Не удалось сохранить {target}")
     if save_contrast:
         contrast_dir = output / "contrast"
         contrast_dir.mkdir(exist_ok=True)
-        contrast_image = cv.convertScaleAbs(contrast, alpha=2.5)
+        contrast_image = cv.convertScaleAbs(recognition.contrast, alpha=2.5)
         contrast_image = cv.cvtColor(contrast_image, cv.COLOR_GRAY2BGR)
         draw_zone(contrast_image, zone)
         contrast_path = contrast_dir / f"{path.name}.png"
         if not cv.imwrite(str(contrast_path), contrast_image, [cv.IMWRITE_PNG_COMPRESSION, 3]):
             raise ValueError(f"Не удалось сохранить {contrast_path}")
-    return len(visible)
+    if stages:
+        stages_dir = output / "stages"
+        stages_dir.mkdir(exist_ok=True)
+        draw_zone(image, zone)
+        save_stages(stages_dir / f"{path.name}.jpg", image, annotated, recognition, visible)
+    return [face.value for face in visible]
 
 
 def main():
@@ -283,6 +302,9 @@ def main():
         help="Папка результатов (по умолчанию рядом с main.py)",
     )
     parser.add_argument("--contrast", action="store_true", help="Сохранить карту контраста")
+    parser.add_argument(
+        "--stages", action="store_true", help="Сохранить картинки этапов для каждого снимка",
+    )
     args = parser.parse_args()
 
     paths = sorted(args.input.iterdir()) if args.input.is_dir() else [args.input]
@@ -292,9 +314,19 @@ def main():
 
     try:
         args.output.mkdir(parents=True, exist_ok=True)
+        frequencies = Counter()
         for path in paths:
-            count = process(path, args.output, args.contrast)
-            print(f"{path.name}: кубиков в зоне — {count}")
+            values = process(path, args.output, args.contrast, stages=args.stages)
+            frequencies.update(values)
+            print(f"{path.name}: кубиков в зоне — {len(values)}, сумма очков — {sum(values)}")
+        statistics = args.output / "statistics"
+        statistics.mkdir(exist_ok=True)
+        chart = statistics / "distribution.png"
+        save_distribution(chart, frequencies, len(paths))
+        print(f"Всего распознано кубиков: {sum(frequencies.values())}")
+        summary = ", ".join(f"{value} → {frequencies[value]}" for value in PATTERNS)
+        print(f"Частоты по значениям 1–6: {summary}")
+        print(f"График распределения: {chart.resolve()}")
         print(f"Результаты сохранены в {args.output.resolve()}")
     except (OSError, ValueError, cv.error) as error:
         parser.exit(1, f"{error}\n")
